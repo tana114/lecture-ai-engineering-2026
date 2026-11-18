@@ -37,6 +37,7 @@ from app.config import MODEL, api_error_message, get_api_key
 INSTRUCTIONS = """\
 あなたはAIエンジニアリング講座（AIE2026）の学習支援エージェントです。
 - 対象は第1〜3回の本講義資料。講義内容に答える前に必ず search_materials を使う。
+- 検索結果はヒットページだけでなく、context_pages も確認し、前後の文脈を踏まえて答える。
 - 複数の話題や回を組み合わせる質問では、必要に応じて検索を分けて根拠を集める。
 - 回答は取得した本文が裏付ける範囲に限定し、知識だけで穴埋めしない。
 - 距離は正答の確率ではない。資料が返っても答えがなければ、確認できないと伝える。
@@ -58,7 +59,8 @@ TREE_INSTRUCTIONS = """\
 GRAPH_INSTRUCTIONS = """\
 あなたはAIエンジニアリング講座（AIE2026）の学習支援エージェントです。
 - 対象は第1〜3回の本講義資料。まず search_graph で関連ページの候補を探す。
-- seedsは検索で見つかった入口、expandedはグラフをたどって追加された候補。
+- seedsは検索で見つかった入口であり、各seedには context_pages が付く。必要に応じて前後ページも読む。
+- expandedはグラフをたどって追加された候補。
 - seedsとexpandedに含まれるページ本文を確認し、質問の根拠となる内容を使って回答する。
 - 用語が共通していても、質問の答えがあるとは限らない。必要なら別の検索語で探す。
 - 取得した本文に根拠がなければ確認できないと伝え、根拠ごとに「第N回・PDF p.N」を付ける。
@@ -163,6 +165,20 @@ def print_trace(result, elapsed_seconds: float | None = None) -> None:
                                 print(f"      {child['content']}")
                         if not data["children"]:
                             print(f"    （末端ページ・本文{len(node.get('content', ''))}文字を取得）")
+                elif part.tool_name in {"search_materials", "search_graph"}:
+                    data = json.loads(part.content)
+                    if "error" in data:
+                        print(f"[tool return] {part.tool_name} -> {data['error']}")
+                    else:
+                        results = data.get("results", data.get("seeds", []))
+                        print(f"[tool return] {part.tool_name} -> {len(results)}件")
+                        for hit in results[:3]:
+                            print(f"  - {hit.get('page_id')} · PDF p.{hit.get('page')} · {hit.get('title')}")
+                            context_pages = hit.get("context_pages")
+                            if context_pages:
+                                print("    context:")
+                                for ctx in context_pages:
+                                    print(f"      ・PDF p.{ctx.get('page')} · {ctx.get('title')}")                        
                 else:
                     print(f"[tool return] {part.tool_name} -> {str(part.content)[:120]}…")
     usage = result.usage

@@ -8,6 +8,7 @@ import sqlite3
 from contextlib import contextmanager
 from collections import defaultdict, deque
 from pathlib import Path
+from functools import lru_cache
 
 from google import genai
 from google.genai import types
@@ -33,8 +34,11 @@ def get_all_materials() -> str:
         for page in section["content"]
     )
 
+@lru_cache(maxsize=1)
 def load_pages(source: Path = RAG_SOURCE) -> list[dict]:
-    """資料→章→ページのJSONを、対象資料のページ一覧に変換する。"""
+    """資料→章→ページのJSONを、対象資料のページ一覧に変換する。
+    何度も同じ出た読み込みをすることになるのでlru_cacheでキャッシュ化する
+    """
     documents = json.loads(source.read_text(encoding="utf-8"))
     pages = []
     for document in documents:
@@ -48,6 +52,45 @@ def load_pages(source: Path = RAG_SOURCE) -> list[dict]:
                               "page": page["page"], "content": page["content"]})
     return pages
 
+@lru_cache(maxsize=1)
+def get_page_index(source: Path = RAG_SOURCE) -> tuple[dict[str, dict], dict[str, list[dict]]]:
+    """ ページ一覧を渡して、page_idやdocumnt_idで索引できる辞書型のデータを作成する
+    Args:
+        source : RAG_SOURCE
+
+    Returns:
+        tuple[dict[str, dict], dict[str, list[dict]]]:
+        page_by_id : page_id をkeyとしたもの
+        pages_by_document :  document_id 毎にページをページ順に並べたもの
+    """
+    pages = load_pages(source)
+    page_by_id = {page["page_id"]: page for page in pages}
+    pages_by_document: dict[str, list[dict]] = defaultdict(list)
+    for page in pages:
+        pages_by_document[page["document_id"]].append(page)
+    for document_pages in pages_by_document.values():
+        document_pages.sort(key=lambda page: page["page"])
+    return page_by_id, pages_by_document
+
+
+def collect_context_pages(page: dict, pages_by_document: dict[str, list[dict]]) -> list[dict]:
+    """ 渡したページの前後ページの本文を取得するための関数
+    Args:
+        page (dict): 指定するページ情報
+        pages_by_document (dict[str, list[dict]]): get_page_index()で作成する索引情報
+
+    Returns:
+        list[dict]: 前後ページを含むページ本文
+    """
+    document_pages = pages_by_document[page["document_id"]]
+    index = next(i for i, p in enumerate(document_pages) if p["page_id"] == page["page_id"])
+    context = []
+    if index > 0:
+        context.append(document_pages[index - 1])
+    context.append(document_pages[index])
+    if index + 1 < len(document_pages):
+        context.append(document_pages[index + 1])
+    return context
 
 def browse_tree(node_id: str | None = None) -> dict:
     """直下のページは先頭文、指定したページ自身は全文を返す。"""
@@ -108,6 +151,12 @@ def embed_text(text: str, task_type: str) -> list[float]:
     return normalized_vector(embedding.values)
 
 
+'''
+@contextmanager は、Pythonの関数を with 文 で使えるようにするためのデコレータ
+yield の代わりに return db を使うと、その瞬間に finally ブロックが実行されてしまいます。
+• return を使った場合、呼び出し元に db が渡る直前に db.close() が動いてしまい、すでに閉じたデータベースを渡すことになってしまいます。
+• yield を使うことで、呼び出し側の処理が終わるまで db.close() の実行を待たせることができます。
+'''
 @contextmanager
 def open_index(path: Path):
     """既存の検索DBを読み取り専用で開き、終了時に閉じる。"""
@@ -128,6 +177,10 @@ def search(query: str) -> list[dict]:
     """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
+
+    # 検索全体で共有する重複排除用の集合
+    seen_page_ids: set[str] = set()
+
     with open_index(RAG_DB) as db:
         vector = embed_text(query.strip(), "RETRIEVAL_QUERY")
         rows = db.execute("""
@@ -135,15 +188,46 @@ def search(query: str) -> list[dict]:
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
         """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        hits = [dict(row) for row in rows]
+
+    # ページ本文と、資料ごとのページ順を先に作っておく
+    page_by_id, pages_by_document = get_page_index(RAG_SOURCE)
+
+    results = []
+    for hit in hits:
+        page = page_by_id[hit["page_id"]]
+        context_pages = []
+
+        # そのヒットの前後1ページを、検索全体で共有する seen_page_ids を使って重複排除する
+        for ctx in collect_context_pages(page, pages_by_document):
+            if ctx["page_id"] in seen_page_ids:
+                continue
+            seen_page_ids.add(ctx["page_id"])
+            context_pages.append(ctx)
+
+        results.append({
+            **hit,
+            "context_pages": context_pages,
+        })
+
+    return results
 
 
 def search_graph(query: str) -> dict:
     """ベクトル検索を入口に、前後ページと共通用語で候補を広げる。"""
+    # まず、講義資料のページだけを page_id -> page の辞書にする。
+    # ここでは graph.json の中の page ノードと対応づけるために使う。
     pages = {page["page_id"]: page for page in load_pages(RAG_SOURCE)}
+
+    # graph.json を読み込み、ページや用語をノードとして扱えるようにする。
+    # term ノードと、実際の検索対象ページだけを残しておくと、後続処理が軽くなる。
     graph = json.loads(RAG_GRAPH.read_text(encoding="utf-8"))
     nodes = {node["id"]: node for node in graph["nodes"]
              if node["kind"] == "term" or node["id"] in pages}
+
+    # 隣接リストを作る。
+    # adjacent[node_id] には、そのノードから 1 step で行けるノードIDの集合が入る。
+    # next_page は前後ページのつながり、mentions はページと用語のつながり。
     adjacent = defaultdict(set)
     for edge in graph["edges"]:
         a, b = edge["source"], edge["target"]
@@ -151,40 +235,72 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
+    # 入口は、ベクトル検索で近かったページ。
+    # その中でも本講義ページだけを seed にし、探索の起点にする。
     seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
         root = seed["page_id"]
-        results.append({**pages[root], "distance": seed["distance"], "hops": 0,
-                        "path": [{"id": root, "title": pages[root]["title"]}]})
+
+        # seed 自身を結果に入れる。context_pages には search() 側で付けた前後ページが入る。
+        results.append({
+            **pages[root],
+            "distance": seed["distance"],
+            "hops": 0,
+            "path": [{"id": root, "title": pages[root]["title"]}],
+            "context_pages": seed.get("context_pages", []),
+        })
+
+        # queue は BFS のための待ち行列。
+        # path には「root からここまでの経路」を保存しておく。
         queue = deque([(root, [root])])
         visited = {root}
         while queue:
             current, path = queue.popleft()
+
+            # hop 数が上限に達したら、それ以上は広げない。
             if len(path) - 1 >= GRAPH_HOPS:
                 continue
+
             # 同じ深さなら、接続先が少ない用語からたどる。
+            # つまり、広くつながりすぎる一般語より、比較的具体的なノードを先に見る。
             neighbors = sorted(adjacent[current], key=lambda n: (len(adjacent[n]), n))
             for neighbor in neighbors:
+
+                # すでに見たノードは再訪しない。
                 if neighbor in visited:
                     continue
                 visited.add(neighbor)
+
+                # 1つ先へ進んだ経路を作る。
                 route = path + [neighbor]
                 queue.append((neighbor, route))
+
+                # 最終候補にするのはページだけ。
+                # 用語ノードは探索の中継点として使うが、出力候補にはしない。
                 if neighbor not in pages or neighbor in seed_ids:
                     continue
+
+                # 経路に含まれる term ノードの接続数を見て、
+                # どれくらい「広がりすぎた経路」かをざっくり数値化する。
                 frequency = max((len(adjacent[n]) for n in route if nodes[n]["kind"] == "term"), default=0)
+
+                # priority が小さいものほど優先。
+                # 1) hop が短いもの
+                # 2) 用語のつながりが少ないもの
+                # 3) seed の順位が早いもの
+                # 4) ID が小さいもの
                 priority = (len(route) - 1, frequency, rank, neighbor)
                 candidate = {**pages[neighbor], "hops": len(route) - 1,
                              "path": [{"id": n, "title": nodes[n]["title"]} for n in route]}
                 if neighbor not in candidates or priority < candidates[neighbor][0]:
                     candidates[neighbor] = (priority, candidate)
+
+    # priority の順に候補を並べ、上限件数だけ返す。
     expanded = [candidate for _, candidate in sorted(candidates.values())]
     return {"seeds": results, "expanded": expanded[:max(0, GRAPH_MAX_RESULTS - len(results))],
             "max_hops": GRAPH_HOPS}
-
-
 
 def run_full_context(agent, question: str, model, instructions: str, prompt_template: str):
     """全資料を一括投入し、検索ツールを使わずに回答する。"""
@@ -208,4 +324,9 @@ if __name__ == "__main__":
         print(f"章: {result['section']}")
         print(f"タイトル: {result['title']}")
         print(f"ページ: {result['page']}")
-        print(f"\n{result['content']}")
+        print(f"距離: {result['distance']:.4f}")
+
+        print("\n--- 前後ページ込み ---")
+        for ctx in result["context_pages"]:
+            print(f"\n[PDF p.{ctx['page']}] {ctx['title']}")
+            print(ctx["content"])

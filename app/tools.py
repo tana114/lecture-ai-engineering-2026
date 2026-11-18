@@ -84,7 +84,9 @@ def get_lecture_summary(lecture: int) -> str:
 def search_materials(query: str) -> str:
     """第1〜3回の本講義資料を検索し、関連ページの本文・タイトル・ページ番号を返す。
 
-    queryに調べたい内容を指定する。
+    返り値は JSON 文字列で、results に検索ヒットの一覧が入る。
+    各ヒットには context_pages が入り、同じ資料内の前後ページを含む。
+    query に調べたい内容を指定する
     """
     from google.genai.errors import APIError
     import sqlite3
@@ -114,7 +116,8 @@ def browse_tree(node_id: str | None = None) -> str:
 def search_graph(query: str) -> str:
     """資料を検索し、前後ページ・共通用語をたどって関連ページの本文と引用情報を返す。
 
-    queryに調べたい内容を指定する。
+    入口の検索ヒットには context_pages が付き、同じ資料内の前後ページも参照できる。
+    query に調べたい内容を指定する。
     """
     import sqlite3
     from google.genai.errors import APIError
