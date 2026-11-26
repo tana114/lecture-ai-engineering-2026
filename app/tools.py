@@ -3,7 +3,7 @@
 ここに書いた関数の docstring と型ヒントが、そのままモデルへの「ツールの説明文」になる。
 説明文を書き換えると、モデルがツールを使うかどうか・どんな引数で呼ぶかが変わる。
 """
-
+import random
 import json
 from functools import cache
 from pathlib import Path
@@ -126,3 +126,29 @@ def search_graph(query: str) -> str:
         return json.dumps({"error": str(e)}, ensure_ascii=False)
     except APIError as e:
         return json.dumps({"error": api_error_message(e.code)}, ensure_ascii=False)
+
+
+def make_quiz(lecture: int) -> str:
+    """指定した回の用語から1つを選び、確認問題と答えを返す。
+
+    「第2回の確認問題を出して」のように、
+    復習用の問題を求められたときに使う。
+
+    返り値は question と answer を含む JSON 文字列。
+    """
+    # 1. load_glossary() から lecture が一致する用語を集める
+    terms = [entry for entry in load_glossary() if entry["lecture"] == lecture]
+    if not terms:
+        return f"第{lecture}回の用語集に用語がないため、確認問題を作れません。"
+
+    # 2. 1 つ選ぶ（random.choice）
+    entry = random.choice(terms)
+
+    # 3. 問題と答えを文字列で返す（json.dumps）
+    return json.dumps(
+        {
+            "question": f"「{entry['term']}」の意味は？",
+            "answer": entry["definition"],
+        },
+        ensure_ascii=False,
+    )
